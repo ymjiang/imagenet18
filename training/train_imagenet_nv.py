@@ -23,9 +23,28 @@ import copy
 
 import dataloader
 import experimental_utils
-import dist_utils
+# import dist_utils
 from logger import TensorboardLogger, FileLogger
 from meter import AverageMeter, NetworkMeter, TimeMeter
+
+from torch.nn.parallel import DistributedDataParallel
+import byteps.torch as bps
+
+class DDP(DistributedDataParallel):
+    # Distributed wrapper. Supports asynchronous evaluation and model saving
+    def forward(self, *args, **kwargs):
+        # DDP has a sync point on forward. No need to do this for eval. This allows us to have different batch sizes
+        if self.training:
+            return super().forward(*args, **kwargs)
+        else:
+            return self.module(*args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        self.module.load_state_dict(*args, **kwargs)
+
+    def state_dict(self, *args, **kwargs):
+        return self.module.state_dict(*args, **kwargs)
+
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
@@ -66,41 +85,46 @@ def get_parser():
                         help='how long to wait until shutting down on success')
     parser.add_argument('--auto-shutdown-failure-delay-mins', default=60, type=int,
                         help='how long to wait before shutting down on error')
-
-
+    parser.add_argument('--batches-per-pushpull', type=int, default=1,
+                        help='number of batches processed locally before '
+                             'executing pushpull across workers; it multiplies '
+                             'total batch size.')
     parser.add_argument('--short-epoch', action='store_true',
                         help='make epochs short (for debugging)')
     return parser
+
+bps.init()
 
 cudnn.benchmark = True
 args = get_parser().parse_args()
 
 # Only want master rank logging to tensorboard
-is_master = (not args.distributed) or (dist_utils.env_rank()==0)
-is_rank0 = args.local_rank == 0
+is_master = (not args.distributed) or (bps.rank()==0)
+is_rank0 = bps.local_rank() == 0
 tb = TensorboardLogger(args.logdir, is_master=is_master)
 log = FileLogger(args.logdir, is_master=is_master, is_rank0=is_rank0)
 
+
 def main():
-    os.system('shutdown -c')  # cancel previous shutdown command
+    # os.system('shutdown -c')  # cancel previous shutdown command
     log.console(args)
-    tb.log('sizes/world', dist_utils.env_world_size())
+    tb.log('sizes/world', bps.size())
 
     # need to index validation directory before we start counting the time
-    dataloader.sort_ar(args.data+'/validation')
-    
+    dataloader.sort_ar(args.data+'/ILSVRC2012_img_val')
+
     if args.distributed:
         log.console('Distributed initializing process group')
-        torch.cuda.set_device(args.local_rank)
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=dist_utils.env_world_size())
-        assert(dist_utils.env_world_size() == dist.get_world_size())
-        log.console("Distributed: success (%d/%d)"%(args.local_rank, dist.get_world_size()))
+        torch.cuda.set_device(bps.local_rank())
+        log.console(f'cuda initialized: {bps.local_rank()}')
+        # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=bps.size())
+        log.console("Distributed: success (%d/%d)"%(bps.rank(), bps.size()))
 
 
-    log.console("Loading model")
+    log.console("Loading model (rank=%d)"%(bps.rank()))
     model = resnet.resnet50(bn0=args.init_bn0).cuda()
     if args.fp16: model = network_to_half(model)
-    if args.distributed: model = dist_utils.DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+    if args.distributed: model = DDP(model, device_ids=[bps.local_rank()], output_device=bps.local_rank())
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
 
     global model_params, master_params
@@ -112,14 +136,23 @@ def main():
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
-    
+
+    # wrap with byteps optimizer
+    optimizer = bps.DistributedOptimizer(
+        optimizer, named_parameters=model.named_parameters(),
+        backward_passes_per_step=args.batches_per_pushpull)
+
     if args.resume:
         checkpoint = torch.load(args.resume, map_location = lambda storage, loc: storage.cuda(args.local_rank))
         model.load_state_dict(checkpoint['state_dict'])
         args.start_epoch = checkpoint['epoch']
         best_top5 = checkpoint['best_top5']
         optimizer.load_state_dict(checkpoint['optimizer'])
-            
+
+    # BytePS: broadcast parameters & optimizer state.
+    bps.broadcast_parameters(model.state_dict(), root_rank=0)
+    bps.broadcast_optimizer_state(optimizer, root_rank=0)
+
     # save script so we can reproduce from logs
     shutil.copy2(os.path.realpath(__file__), f'{args.logdir}')
 
@@ -132,8 +165,13 @@ def main():
     if args.evaluate: return validate(dm.val_dl, model, criterion, 0, start_time)
 
     if args.distributed:
-        log.console('Syncing machines before training')
-        dist_utils.sum_tensor(torch.tensor([1.0]).float().cuda())
+        log.console('Global Barrier: Syncing machines before training')
+        tensor = torch.tensor([1.0]).float().cuda()
+        barrier_handler = bps.push_pull_async_inplace(tensor, average=True, name="Barrier")
+        while True:
+            if bps.poll(barrier_handler):
+                bps.synchronize(barrier_handler)
+                break
 
     log.event("~~epoch\thours\ttop1\ttop5\n")
     for epoch in range(args.start_epoch, scheduler.tot_epochs):
@@ -193,8 +231,10 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         reduced_loss, batch_total = to_python_float(loss.data), to_python_float(input.size(0))
         if args.distributed: # Must keep track of global batch size, since not all machines are guaranteed equal batches at the end of an epoch
             metrics = torch.tensor([batch_total, reduced_loss, corr1, corr5]).float().cuda()
-            batch_total, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
-            reduced_loss = reduced_loss/dist_utils.env_world_size()
+            batch_total, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="tensor"+str(i))
+            reduced_loss = reduced_loss/bps.size()
+            # batch_total, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
+            # reduced_loss = reduced_loss/dist_utils.env_world_size()
         top1acc = to_python_float(corr1)*(100.0/batch_total)
         top5acc = to_python_float(corr5)*(100.0/batch_total)
 
@@ -239,7 +279,7 @@ def validate(val_loader, model, criterion, epoch, start_time):
         batch_num = i+1
         timer.batch_start()
         if args.distributed:
-            top1acc, top5acc, loss, batch_total = distributed_predict(input, target, model, criterion)
+            top1acc, top5acc, loss, batch_total = distributed_predict(input, target, model, criterion, i)
         else:
             with torch.no_grad():
                 output = model(input)
@@ -266,7 +306,7 @@ def validate(val_loader, model, criterion, epoch, start_time):
 
     return top1.avg, top5.avg
 
-def distributed_predict(input, target, model, criterion):
+def distributed_predict(input, target, model, criterion, cnt):
     # Allows distributed prediction on uneven batches. Test set isn't always large enough for every GPU to get a batch
     batch_size = input.size(0)
     output = loss = corr1 = corr5 = valid_batches = 0
@@ -280,8 +320,11 @@ def distributed_predict(input, target, model, criterion):
         corr1, corr5 = correct(output.data, target, topk=(1, 5))
 
     metrics = torch.tensor([batch_size, valid_batches, loss, corr1, corr5]).float().cuda()
-    batch_total, valid_batches, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
+
+    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="validation_tensor" + str(cnt))
     reduced_loss = reduced_loss/valid_batches
+    # batch_total, valid_batches, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
+    # reduced_loss = reduced_loss/valid_batches
 
     top1 = corr1*(100.0/batch_total)
     top5 = corr5*(100.0/batch_total)
@@ -327,8 +370,8 @@ class DataManager():
     def expand_directories(self, phase):
         trndir = phase.get('trndir', '')
         valdir = phase.get('valdir', trndir)
-        phase['trndir'] = args.data+trndir+'/train'
-        phase['valdir'] = args.data+valdir+'/validation'
+        phase['trndir'] = args.data+trndir+'/ILSVRC2012_img_train'
+        phase['valdir'] = args.data+valdir+'/ILSVRC2012_img_val'
 
     def preload_data(self, ep, sz, bs, trndir, valdir, **kwargs): # dummy ep var to prevent error
         if 'lr' in kwargs: del kwargs['lr'] # in case we mix schedule and data phases
