@@ -29,6 +29,8 @@ from meter import AverageMeter, NetworkMeter, TimeMeter
 
 from torch.nn.parallel import DistributedDataParallel
 import byteps.torch as bps
+from byteps.torch.ops import push_pull_async_inplace, poll, synchronize
+from torchvision import models
 
 class DDP(DistributedDataParallel):
     # Distributed wrapper. Supports asynchronous evaluation and model saving
@@ -91,7 +93,89 @@ def get_parser():
                              'total batch size.')
     parser.add_argument('--short-epoch', action='store_true',
                         help='make epochs short (for debugging)')
+    parser.add_argument('--machines', type=int, default=16,
+                        help="how many machines to use")
     return parser
+
+
+lr = 1.0
+bs = [512, 224, 128]  # largest batch size that fits in memory for each image size
+bs_scale = [x / bs[0] for x in bs]
+one_machine = [
+    {'ep': 0, 'sz': 128, 'bs': bs[0]},
+    {'ep': (0, 7), 'lr': (lr, lr * 2)},  # lr warmup is better with --init-bn0
+    {'ep': (7, 13), 'lr': (lr * 2, lr / 4)},  # trying one cycle
+    {'ep': 13, 'sz': 224, 'bs': bs[1], 'min_scale': 0.087},
+    {'ep': (13, 22), 'lr': (lr * bs_scale[1], lr / 10 * bs_scale[1])},
+    {'ep': (22, 25), 'lr': (lr / 10 * bs_scale[1], lr / 100 * bs_scale[1])},
+    {'ep': 25, 'sz': 288, 'bs': bs[2], 'min_scale': 0.5, 'rect_val': True},
+    {'ep': (25, 28), 'lr': (lr / 100 * bs_scale[2], lr / 1000 * bs_scale[2])}
+]
+
+# 29:44 to 93.05
+# events: https://s3.amazonaws.com/yaroslavvb/logs/imagenet-4
+# logs: https://s3.amazonaws.com/yaroslavvb/logs/imagenet-4.tar
+lr = 0.50 * 4  # 4 = num tasks
+bs = [256, 224, 128]  # largest batch size that fits in memory for each image size
+bs_scale = [x / bs[0] for x in bs]  # scale learning rate to batch size
+four_machines = [
+    {'ep': 0, 'sz': 128, 'bs': bs[0]},  # bs = 256 * 4 * 8 = 8192
+    {'ep': (0, 6), 'lr': (lr, lr * 2)},
+    {'ep': 6, 'sz': 128, 'bs': bs[0] * 2, 'keep_dl': True},
+    {'ep': 6, 'lr': lr * 2},
+    {'ep': (11, 13), 'lr': (lr * 2, lr)},  # trying one cycle
+    {'ep': 13, 'sz': 224, 'bs': bs[1], 'min_scale': 0.087},
+    {'ep': 13, 'lr': lr * bs_scale[1]},
+    {'ep': (16, 24), 'lr': (lr * bs_scale[1], lr / 10 * bs_scale[1])},
+    {'ep': (24, 28), 'lr': (lr / 10 * bs_scale[1], lr / 100 * bs_scale[1])},
+    {'ep': 28, 'sz': 288, 'bs': bs[2], 'min_scale': 0.5, 'rect_val': True},
+    {'ep': (28, 30), 'lr': (lr / 100 * bs_scale[2], lr / 1000 * bs_scale[2])}
+]
+
+# 19:04 to 93.0
+# events: https://s3.amazonaws.com/yaroslavvb/logs/imagenet-16.02.8
+# logs: https://s3.amazonaws.com/yaroslavvb/logs/imagenet-8.tar
+lr = 0.24 * 8
+scale_224 = 224 / 128
+eight_machines = [
+    {'ep': 0, 'sz': 128, 'bs': 128},
+    {'ep': (0, 6), 'lr': (lr, lr * 2)},
+    {'ep': 6, 'bs': 256, 'keep_dl': True,
+     'lr': lr * 2},
+    {'ep': (11, 14), 'lr': (lr * 2, lr)},  # trying one cycle
+    {'ep': 14, 'sz': 224, 'bs': 128, 'min_scale': 0.087,
+     'lr': lr},
+    {'ep': 17, 'bs': 224, 'keep_dl': True},
+    {'ep': (17, 23), 'lr': (lr, lr / 10 * scale_224)},
+    {'ep': (23, 29), 'lr': (lr / 10 * scale_224, lr / 100 * scale_224)},
+    {'ep': 29, 'sz': 288, 'bs': 128, 'min_scale': 0.5, 'rect_val': True},
+    {'ep': (29, 36), 'lr': (lr / 100, lr / 1000)}
+]
+
+# 16:08 to 93.04 (after prewarming)
+# events: https://s3.amazonaws.com/yaroslavvb/logs/imagenet-16.02.thu16
+# logs: https://s3.amazonaws.com/yaroslavvb/logs/imagenet-16.cmd.tar
+lr = 0.235 * 8  #
+bs = 64
+sixteen_machines = [
+    {'ep': 0, 'sz': 128, 'bs': 64},
+    {'ep': (0, 6), 'lr': (lr, lr * 2)},
+    {'ep': 6, 'bs': 128, 'keep_dl': True},
+    {'ep': 6, 'lr': lr * 2},
+    {'ep': 16, 'sz': 224, 'bs': 64},  # todo: increase this bs
+    {'ep': 16, 'lr': lr},
+    {'ep': 19, 'bs': 192, 'keep_dl': True},
+    {'ep': 19, 'lr': 2 * lr / (10 / 1.5)},
+    {'ep': 31, 'lr': 2 * lr / (100 / 1.5)},
+    {'ep': 37, 'sz': 288, 'bs': 128, 'min_scale': 0.5, 'rect_val': True},
+    {'ep': 37, 'lr': 2 * lr / 100},
+    {'ep': (38, 50), 'lr': 2 * lr / 1000}
+]
+
+schedules = {1: one_machine,
+             4: four_machines,
+             8: eight_machines,
+             16: sixteen_machines}
 
 bps.init()
 
@@ -104,7 +188,6 @@ is_rank0 = bps.local_rank() == 0
 tb = TensorboardLogger(args.logdir, is_master=is_master)
 log = FileLogger(args.logdir, is_master=is_master, is_rank0=is_rank0)
 
-
 def main():
     # os.system('shutdown -c')  # cancel previous shutdown command
     log.console(args)
@@ -113,18 +196,19 @@ def main():
     # need to index validation directory before we start counting the time
     dataloader.sort_ar(args.data+'/ILSVRC2012_img_val')
 
-    if args.distributed:
-        log.console('Distributed initializing process group')
-        torch.cuda.set_device(bps.local_rank())
-        log.console(f'cuda initialized: {bps.local_rank()}')
-        # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=bps.size())
-        log.console("Distributed: success (%d/%d)"%(bps.rank(), bps.size()))
-
+    # if args.distributed:
+    # log.console('Distributed initializing process group')
+    torch.cuda.set_device(bps.local_rank())
+    log.console("cuda initialized (rank=%d)"%(bps.local_rank()))
+    # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=bps.size())
+    log.console("Distributed: success (%d/%d)"%(bps.rank(), bps.size()))
 
     log.console("Loading model (rank=%d)"%(bps.rank()))
-    model = resnet.resnet50(bn0=args.init_bn0).cuda()
+    model = models.resnet50().cuda()
+    # model = resnet.resnet50(bn0=args.init_bn0).cuda()
+
     if args.fp16: model = network_to_half(model)
-    if args.distributed: model = DDP(model, device_ids=[bps.local_rank()], output_device=bps.local_rank())
+    # if args.distributed: model = DDP(model, device_ids=[bps.local_rank()], output_device=bps.local_rank())
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
 
     global model_params, master_params
@@ -135,7 +219,8 @@ def main():
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
+    # optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
+    optimizer = torch.optim.SGD(model.parameters(), 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
 
     # wrap with byteps optimizer
     optimizer = bps.DistributedOptimizer(
@@ -149,17 +234,17 @@ def main():
         best_top5 = checkpoint['best_top5']
         optimizer.load_state_dict(checkpoint['optimizer'])
 
+    # save script so we can reproduce from logs
+    # shutil.copy2(os.path.realpath(__file__), f'{args.logdir}')
+
+    log.console("Creating data loaders (this could take up to 10 minutes if volume needs to be warmed up)")
+    phases = schedules[args.machines]
+    dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
+    scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
+
     # BytePS: broadcast parameters & optimizer state.
     bps.broadcast_parameters(model.state_dict(), root_rank=0)
     bps.broadcast_optimizer_state(optimizer, root_rank=0)
-
-    # save script so we can reproduce from logs
-    shutil.copy2(os.path.realpath(__file__), f'{args.logdir}')
-
-    log.console("Creating data loaders (this could take up to 10 minutes if volume needs to be warmed up)")
-    phases = eval(args.phases)
-    dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
-    scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
     start_time = datetime.now() # Loading start to after everything is loaded
     if args.evaluate: return validate(dm.val_dl, model, criterion, 0, start_time)
@@ -167,10 +252,10 @@ def main():
     if args.distributed:
         log.console('Global Barrier: Syncing machines before training')
         tensor = torch.tensor([1.0]).float().cuda()
-        barrier_handler = bps.push_pull_async_inplace(tensor, average=True, name="Barrier")
+        barrier_handler = push_pull_async_inplace(tensor, average=True, name="Barrier")
         while True:
-            if bps.poll(barrier_handler):
-                bps.synchronize(barrier_handler)
+            if poll(barrier_handler):
+                synchronize(barrier_handler)
                 break
 
     log.event("~~epoch\thours\ttop1\ttop5\n")
