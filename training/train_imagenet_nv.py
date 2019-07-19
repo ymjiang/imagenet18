@@ -32,22 +32,6 @@ import byteps.torch as bps
 from byteps.torch.ops import push_pull_async_inplace, poll, synchronize
 from torchvision import models
 
-class DDP(DistributedDataParallel):
-    # Distributed wrapper. Supports asynchronous evaluation and model saving
-    def forward(self, *args, **kwargs):
-        # DDP has a sync point on forward. No need to do this for eval. This allows us to have different batch sizes
-        if self.training:
-            return super().forward(*args, **kwargs)
-        else:
-            return self.module(*args, **kwargs)
-
-    def load_state_dict(self, *args, **kwargs):
-        self.module.load_state_dict(*args, **kwargs)
-
-    def state_dict(self, *args, **kwargs):
-        return self.module.state_dict(*args, **kwargs)
-
-
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
     parser.add_argument('data', metavar='DIR', help='path to dataset')
@@ -97,15 +81,32 @@ def get_parser():
                         help="how many machines to use")
     return parser
 
-
+# 109:12 to 93.00
+# events: https://s3.amazonaws.com/yaroslavvb/logs/imagenet-1
+# logs: https://s3.amazonaws.com/yaroslavvb/logs/imagenet1.tar
 lr = 1.0
 bs = [512, 224, 128]  # largest batch size that fits in memory for each image size
 bs_scale = [x / bs[0] for x in bs]
 one_machine = [
-    {'ep': 0, 'sz': 128, 'bs': bs[0]},
+    {'ep': 0, 'sz': 128, 'bs': bs[0], 'trndir': '-sz/160'},
     {'ep': (0, 7), 'lr': (lr, lr * 2)},  # lr warmup is better with --init-bn0
     {'ep': (7, 13), 'lr': (lr * 2, lr / 4)},  # trying one cycle
-    {'ep': 13, 'sz': 224, 'bs': bs[1], 'min_scale': 0.087},
+    {'ep': 13, 'sz': 224, 'bs': bs[1], 'trndir': '-sz/352', 'min_scale': 0.087},
+    {'ep': (13, 22), 'lr': (lr * bs_scale[1], lr / 10 * bs_scale[1])},
+    {'ep': (22, 25), 'lr': (lr / 10 * bs_scale[1], lr / 100 * bs_scale[1])},
+    {'ep': 25, 'sz': 288, 'bs': bs[2], 'min_scale': 0.5, 'rect_val': True},
+    {'ep': (25, 28), 'lr': (lr / 100 * bs_scale[2], lr / 1000 * bs_scale[2])}
+]
+
+# this is just for 16 GPUs testing, the setup does not make sense
+lr = 1.0
+bs = [512, 224, 128]  # largest batch size that fits in memory for each image size
+bs_scale = [x / bs[0] for x in bs]
+two_machine = [
+    {'ep': 0, 'sz': 128, 'bs': bs[0], 'trndir': '-sz/160'},
+    {'ep': (0, 7), 'lr': (lr, lr * 2)},  # lr warmup is better with --init-bn0
+    {'ep': (7, 13), 'lr': (lr * 2, lr / 4)},  # trying one cycle
+    {'ep': 13, 'sz': 224, 'bs': bs[1], 'trndir': '-sz/352', 'min_scale': 0.087},
     {'ep': (13, 22), 'lr': (lr * bs_scale[1], lr / 10 * bs_scale[1])},
     {'ep': (22, 25), 'lr': (lr / 10 * bs_scale[1], lr / 100 * bs_scale[1])},
     {'ep': 25, 'sz': 288, 'bs': bs[2], 'min_scale': 0.5, 'rect_val': True},
@@ -119,12 +120,12 @@ lr = 0.50 * 4  # 4 = num tasks
 bs = [256, 224, 128]  # largest batch size that fits in memory for each image size
 bs_scale = [x / bs[0] for x in bs]  # scale learning rate to batch size
 four_machines = [
-    {'ep': 0, 'sz': 128, 'bs': bs[0]},  # bs = 256 * 4 * 8 = 8192
+    {'ep': 0, 'sz': 128, 'bs': bs[0], 'trndir': '-sz/160'},  # bs = 256 * 4 * 8 = 8192
     {'ep': (0, 6), 'lr': (lr, lr * 2)},
     {'ep': 6, 'sz': 128, 'bs': bs[0] * 2, 'keep_dl': True},
     {'ep': 6, 'lr': lr * 2},
     {'ep': (11, 13), 'lr': (lr * 2, lr)},  # trying one cycle
-    {'ep': 13, 'sz': 224, 'bs': bs[1], 'min_scale': 0.087},
+    {'ep': 13, 'sz': 224, 'bs': bs[1], 'trndir': '-sz/352', 'min_scale': 0.087},
     {'ep': 13, 'lr': lr * bs_scale[1]},
     {'ep': (16, 24), 'lr': (lr * bs_scale[1], lr / 10 * bs_scale[1])},
     {'ep': (24, 28), 'lr': (lr / 10 * bs_scale[1], lr / 100 * bs_scale[1])},
@@ -138,12 +139,12 @@ four_machines = [
 lr = 0.24 * 8
 scale_224 = 224 / 128
 eight_machines = [
-    {'ep': 0, 'sz': 128, 'bs': 128},
+    {'ep': 0, 'sz': 128, 'bs': 128, 'trndir': '-sz/160'},
     {'ep': (0, 6), 'lr': (lr, lr * 2)},
     {'ep': 6, 'bs': 256, 'keep_dl': True,
      'lr': lr * 2},
     {'ep': (11, 14), 'lr': (lr * 2, lr)},  # trying one cycle
-    {'ep': 14, 'sz': 224, 'bs': 128, 'min_scale': 0.087,
+    {'ep': 14, 'sz': 224, 'bs': 128, 'trndir': '-sz/352', 'min_scale': 0.087,
      'lr': lr},
     {'ep': 17, 'bs': 224, 'keep_dl': True},
     {'ep': (17, 23), 'lr': (lr, lr / 10 * scale_224)},
@@ -158,7 +159,7 @@ eight_machines = [
 lr = 0.235 * 8  #
 bs = 64
 sixteen_machines = [
-    {'ep': 0, 'sz': 128, 'bs': 64},
+    {'ep': 0, 'sz': 128, 'bs': 64, 'trndir': '-sz/160'},
     {'ep': (0, 6), 'lr': (lr, lr * 2)},
     {'ep': 6, 'bs': 128, 'keep_dl': True},
     {'ep': 6, 'lr': lr * 2},
@@ -173,6 +174,7 @@ sixteen_machines = [
 ]
 
 schedules = {1: one_machine,
+             2: two_machine,
              4: four_machines,
              8: eight_machines,
              16: sixteen_machines}
@@ -194,7 +196,7 @@ def main():
     tb.log('sizes/world', bps.size())
 
     # need to index validation directory before we start counting the time
-    dataloader.sort_ar(args.data+'/ILSVRC2012_img_val')
+    dataloader.sort_ar(args.data+'/validation')
 
     # if args.distributed:
     # log.console('Distributed initializing process group')
@@ -204,11 +206,9 @@ def main():
     log.console("Distributed: success (%d/%d)"%(bps.rank(), bps.size()))
 
     log.console("Loading model (rank=%d)"%(bps.rank()))
-    model = models.resnet50().cuda()
-    # model = resnet.resnet50(bn0=args.init_bn0).cuda()
+    model = resnet.resnet50(bn0=args.init_bn0).cuda()
 
     if args.fp16: model = network_to_half(model)
-    # if args.distributed: model = DDP(model, device_ids=[bps.local_rank()], output_device=bps.local_rank())
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
 
     global model_params, master_params
@@ -219,12 +219,25 @@ def main():
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
-    # optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
-    optimizer = torch.optim.SGD(model.parameters(), 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
+    optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
+
+    name_list = []
+    for name, _ in list(model.named_parameters()):
+        name_list.append(name)
+
+    named_param = []
+    for p in optim_params:
+        tensors = p['params']
+        for tensor in tensors:
+            named_param.append(tensor)
+
+    log.console(f'namelist={len(name_list)}, paramlist={len(named_param)}')
+    assert len(name_list) == len(named_param), f'{len(name_list)}, {len(named_param)}'
 
     # wrap with byteps optimizer
+    bps_param = zip(name_list, named_param)
     optimizer = bps.DistributedOptimizer(
-        optimizer, named_parameters=model.named_parameters(),
+        optimizer, named_parameters=bps_param,
         backward_passes_per_step=args.batches_per_pushpull)
 
     if args.resume:
@@ -238,12 +251,14 @@ def main():
     # shutil.copy2(os.path.realpath(__file__), f'{args.logdir}')
 
     log.console("Creating data loaders (this could take up to 10 minutes if volume needs to be warmed up)")
+    assert (args.machines in schedules)
     phases = schedules[args.machines]
     dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
     # BytePS: broadcast parameters & optimizer state.
-    bps.broadcast_parameters(model.state_dict(), root_rank=0)
+    # bps.broadcast_parameters(model.state_dict(), root_rank=0)
+    bps.broadcast_parameters(model.parameters(), root_rank=0)
     bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
@@ -316,7 +331,13 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         reduced_loss, batch_total = to_python_float(loss.data), to_python_float(input.size(0))
         if args.distributed: # Must keep track of global batch size, since not all machines are guaranteed equal batches at the end of an epoch
             metrics = torch.tensor([batch_total, reduced_loss, corr1, corr5]).float().cuda()
-            batch_total, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="tensor"+str(i))
+            batch_total, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="validation_tensor")
+
+            batch_total = batch_total.cpu().numpy()
+            reduced_loss = reduced_loss.cpu().numpy()
+            corr1 = corr1.cpu().numpy()
+            corr5 = corr5.cpu().numpy()
+
             reduced_loss = reduced_loss/bps.size()
             # batch_total, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
             # reduced_loss = reduced_loss/dist_utils.env_world_size()
@@ -455,8 +476,8 @@ class DataManager():
     def expand_directories(self, phase):
         trndir = phase.get('trndir', '')
         valdir = phase.get('valdir', trndir)
-        phase['trndir'] = args.data+trndir+'/ILSVRC2012_img_train'
-        phase['valdir'] = args.data+valdir+'/ILSVRC2012_img_val'
+        phase['trndir'] = args.data+trndir+'/train'
+        phase['valdir'] = args.data+valdir+'/validation'
 
     def preload_data(self, ep, sz, bs, trndir, valdir, **kwargs): # dummy ep var to prevent error
         if 'lr' in kwargs: del kwargs['lr'] # in case we mix schedule and data phases
