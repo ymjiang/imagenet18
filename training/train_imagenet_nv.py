@@ -207,6 +207,7 @@ def main():
 
     log.console("Loading model (rank=%d)"%(bps.rank()))
     model = resnet.resnet50(bn0=args.init_bn0).cuda()
+    param_name_map = {v: k for k, v in sorted(list(model.named_parameters()))}
 
     if args.fp16: model = network_to_half(model)
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
@@ -221,21 +222,23 @@ def main():
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
 
-    name_list = []
-    for name, _ in list(model.named_parameters()):
-        name_list.append(name)
-
     named_param = []
     for p in optim_params:
         tensors = p['params']
         for tensor in tensors:
             named_param.append(tensor)
 
-    log.console(f'namelist={len(name_list)}, paramlist={len(named_param)}')
-    assert len(name_list) == len(named_param), f'{len(name_list)}, {len(named_param)}'
+    # create bps_param (tuple)
+    bps_param = []
+    for tensor in named_param:
+        try:
+            name = param_name_map[tensor]
+            bps_param.append((name, tensor))
+        except:
+            log.console(f'tensor not find in the map, exit now')
+            exit(1)
 
     # wrap with byteps optimizer
-    bps_param = zip(name_list, named_param)
     optimizer = bps.DistributedOptimizer(
         optimizer, named_parameters=bps_param,
         backward_passes_per_step=args.batches_per_pushpull)
@@ -257,8 +260,7 @@ def main():
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
     # BytePS: broadcast parameters & optimizer state.
-    # bps.broadcast_parameters(model.state_dict(), root_rank=0)
-    bps.broadcast_parameters(model.parameters(), root_rank=0)
+    bps.broadcast_parameters(model.state_dict(), root_rank=0)
     bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
