@@ -31,6 +31,7 @@ from torch.nn.parallel import DistributedDataParallel
 import byteps.torch as bps
 from byteps.torch.ops import push_pull_async_inplace, poll, synchronize
 from torchvision import models
+from collections import OrderedDict
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
@@ -207,7 +208,6 @@ def main():
 
     log.console("Loading model (rank=%d)"%(bps.rank()))
     model = resnet.resnet50(bn0=args.init_bn0).cuda()
-    param_name_map = {v: k for k, v in sorted(list(model.named_parameters()))}
 
     if args.fp16: model = network_to_half(model)
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
@@ -216,7 +216,7 @@ def main():
     if args.fp16: model_params, master_params = prep_param_lists(model)
     else: model_params = master_params = model.parameters()
 
-    optim_params = experimental_utils.bnwd_optim_params(model, model_params, master_params) if args.no_bn_wd else master_params
+    optim_params, name_list = experimental_utils.bnwd_optim_params(model, model_params, master_params) if args.no_bn_wd else master_params
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
@@ -230,13 +230,15 @@ def main():
 
     # create bps_param (tuple)
     bps_param = []
+    cnt = 0
     for tensor in named_param:
         try:
-            name = param_name_map[tensor]
-            bps_param.append((name, tensor))
+            name = name_list[cnt]
+            bps_param.append((name, tensor.cpu().detach()))
         except:
-            log.console(f'tensor not find in the map, exit now')
+            log.console(f'tensor {name} not find in the map, exit now')
             exit(1)
+        cnt += 1
 
     # wrap with byteps optimizer
     optimizer = bps.DistributedOptimizer(
@@ -250,17 +252,20 @@ def main():
         best_top5 = checkpoint['best_top5']
         optimizer.load_state_dict(checkpoint['optimizer'])
 
-    # save script so we can reproduce from logs
-    # shutil.copy2(os.path.realpath(__file__), f'{args.logdir}')
-
     log.console("Creating data loaders (this could take up to 10 minutes if volume needs to be warmed up)")
     assert (args.machines in schedules)
     phases = schedules[args.machines]
     dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
+    for name in name_list:
+        log.console(name)
+    log.console(f'#### total tensor count: {len(name_list)} ####')
+
+    log.console(OrderedDict(bps_param))
     # BytePS: broadcast parameters & optimizer state.
-    bps.broadcast_parameters(model.state_dict(), root_rank=0)
+    # bps.broadcast_parameters(model.state_dict(), root_rank=0)
+    bps.broadcast_parameters(OrderedDict(bps_param), root_rank=0)
     bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
