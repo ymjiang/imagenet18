@@ -216,33 +216,17 @@ def main():
     if args.fp16: model_params, master_params = prep_param_lists(model)
     else: model_params = master_params = model.parameters()
 
-    optim_params, name_list = experimental_utils.bnwd_optim_params(model, model_params, master_params) if args.no_bn_wd else master_params
-
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
+    optimizer = torch.optim.SGD(model.parameters(), 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
 
-    named_param = []
-    for p in optim_params:
-        tensors = p['params']
-        for tensor in tensors:
-            named_param.append(tensor)
-
-    # create bps_param (tuple)
-    bps_param = []
-    cnt = 0
-    for tensor in named_param:
-        try:
-            name = name_list[cnt]
-            bps_param.append((name, tensor.cpu().detach()))
-        except:
-            log.console(f'tensor {name} not find in the map, exit now')
-            exit(1)
-        cnt += 1
+    # BytePS: broadcast parameters & optimizer state.
+    bps.broadcast_parameters(model.state_dict(), root_rank=0)
+    bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     # wrap with byteps optimizer
     optimizer = bps.DistributedOptimizer(
-        optimizer, named_parameters=bps_param,
+        optimizer, named_parameters=model.named_parameters(),
         backward_passes_per_step=args.batches_per_pushpull)
 
     if args.resume:
@@ -257,16 +241,6 @@ def main():
     phases = schedules[args.machines]
     dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
-
-    for name in name_list:
-        log.console(name)
-    log.console(f'#### total tensor count: {len(name_list)} ####')
-
-    log.console(OrderedDict(bps_param))
-    # BytePS: broadcast parameters & optimizer state.
-    # bps.broadcast_parameters(model.state_dict(), root_rank=0)
-    bps.broadcast_parameters(OrderedDict(bps_param), root_rank=0)
-    bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
     if args.evaluate: return validate(dm.val_dl, model, criterion, 0, start_time)
@@ -317,20 +291,10 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         output = model(input)
         loss = criterion(output, target)
 
-        # compute gradient and do SGD step
-        if args.fp16:
-            loss = loss*args.loss_scale
-            model.zero_grad()
-            loss.backward()
-            model_grads_to_master_grads(model_params, master_params)
-            for param in master_params: param.grad.data = param.grad.data/args.loss_scale
-            optimizer.step()
-            master_params_to_model_params(model_params, master_params)
-            loss = loss/args.loss_scale
-        else:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        # compute gradient and do SGD step, currently only support fp32
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         # Train batch done. Logging results
         timer.batch_end()
@@ -339,15 +303,12 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         if args.distributed: # Must keep track of global batch size, since not all machines are guaranteed equal batches at the end of an epoch
             metrics = torch.tensor([batch_total, reduced_loss, corr1, corr5]).float().cuda()
             batch_total, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="validation_tensor")
-
             batch_total = batch_total.cpu().numpy()
             reduced_loss = reduced_loss.cpu().numpy()
             corr1 = corr1.cpu().numpy()
             corr5 = corr5.cpu().numpy()
-
             reduced_loss = reduced_loss/bps.size()
-            # batch_total, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
-            # reduced_loss = reduced_loss/dist_utils.env_world_size()
+
         top1acc = to_python_float(corr1)*(100.0/batch_total)
         top5acc = to_python_float(corr5)*(100.0/batch_total)
 
@@ -434,10 +395,11 @@ def distributed_predict(input, target, model, criterion, cnt):
 
     metrics = torch.tensor([batch_size, valid_batches, loss, corr1, corr5]).float().cuda()
 
-    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="validation_tensor" + str(cnt))
+    # average must be false, because reduced loss will be divided later
+    log.console(f'debug: distributed_predict before push_pull, metrics: {metrics}')
+    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="distributed_validation_tensor"+str(cnt))
+    log.console(f'debug: distributed_predict after  push_pull, metrics: {metrics}')
     reduced_loss = reduced_loss/valid_batches
-    # batch_total, valid_batches, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
-    # reduced_loss = reduced_loss/valid_batches
 
     top1 = corr1*(100.0/batch_total)
     top5 = corr5*(100.0/batch_total)
