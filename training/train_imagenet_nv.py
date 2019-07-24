@@ -258,14 +258,8 @@ def main():
     dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
-    for name in name_list:
-        log.console(name)
-    log.console(f'#### total tensor count: {len(name_list)} ####')
-
-    log.console(OrderedDict(bps_param))
     # BytePS: broadcast parameters & optimizer state.
-    # bps.broadcast_parameters(model.state_dict(), root_rank=0)
-    bps.broadcast_parameters(OrderedDict(bps_param), root_rank=0)
+    bps.broadcast_parameters(bps_param, root_rank=0)
     bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
