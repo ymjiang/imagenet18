@@ -202,6 +202,7 @@ def main():
     # if args.distributed:
     # log.console('Distributed initializing process group')
     torch.cuda.set_device(bps.local_rank())
+    print(f'cuda device set to {bps.local_rank()}')
     log.console("cuda initialized (rank=%d)"%(bps.local_rank()))
     # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=bps.size())
     log.console("Distributed: success (%d/%d)"%(bps.rank(), bps.size()))
@@ -230,15 +231,9 @@ def main():
 
     # create bps_param (tuple)
     bps_param = []
-    cnt = 0
-    for tensor in named_param:
-        try:
-            name = name_list[cnt]
-            bps_param.append((name, tensor.cpu().detach()))
-        except:
-            log.console(f'tensor {name} not find in the map, exit now')
-            exit(1)
-        cnt += 1
+    for i, tensor in enumerate(named_param):
+        name = name_list[i]
+        bps_param.append((name, tensor))
 
     # wrap with byteps optimizer
     optimizer = bps.DistributedOptimizer(
@@ -259,7 +254,9 @@ def main():
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
     # BytePS: broadcast parameters & optimizer state.
-    bps.broadcast_parameters(bps_param, root_rank=0)
+    # should use p.detach(), otherwise broadcast p.fill_(0) will report errors.
+    # it should not matter because detach is in-place
+    bps.broadcast_parameters([(name, p.detach()) for name, p in bps_param], root_rank=0)
     bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
@@ -268,7 +265,7 @@ def main():
     if args.distributed:
         log.console('Global Barrier: Syncing machines before training')
         tensor = torch.tensor([1.0]).float().cuda()
-        barrier_handler = push_pull_async_inplace(tensor, average=True, name="Barrier")
+        barrier_handler = push_pull_async_inplace(tensor, average=True, name="init.barrier")
         while True:
             if poll(barrier_handler):
                 synchronize(barrier_handler)
@@ -428,7 +425,7 @@ def distributed_predict(input, target, model, criterion, cnt):
 
     metrics = torch.tensor([batch_size, valid_batches, loss, corr1, corr5]).float().cuda()
 
-    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="validation_tensor" + str(cnt))
+    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="distributed_validation_tensor")
     reduced_loss = reduced_loss/valid_batches
     # batch_total, valid_batches, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
     # reduced_loss = reduced_loss/valid_batches
