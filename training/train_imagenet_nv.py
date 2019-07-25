@@ -210,6 +210,11 @@ def main():
     log.console("Loading model (rank=%d)"%(bps.rank()))
     model = resnet.resnet50(bn0=args.init_bn0).cuda()
 
+    # reuse the validate tensor
+    global validate_tensor, dist_validate_tensor
+    validate_tensor = torch.tensor([0, 0, 0, 0]).float().cuda()
+    dist_validate_tensor = torch.tensor([0, 0, 0, 0, 0]).float().cuda()
+
     if args.fp16: model = network_to_half(model)
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
 
@@ -328,17 +333,17 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         corr1, corr5 = correct(output.data, target, topk=(1, 5))
         reduced_loss, batch_total = to_python_float(loss.data), to_python_float(input.size(0))
         if args.distributed: # Must keep track of global batch size, since not all machines are guaranteed equal batches at the end of an epoch
-            metrics = torch.tensor([batch_total, reduced_loss, corr1, corr5]).float().cuda()
-            batch_total, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="validation_tensor")
-
+            validate_tensor[0] = batch_total
+            validate_tensor[1] = reduced_loss
+            validate_tensor[2] = corr1
+            validate_tensor[3] = corr5
+            batch_total, reduced_loss, corr1, corr5 = bps.push_pull(validate_tensor, average=False, name="validation_tensor")
             batch_total = batch_total.cpu().numpy()
             reduced_loss = reduced_loss.cpu().numpy()
             corr1 = corr1.cpu().numpy()
             corr5 = corr5.cpu().numpy()
-
             reduced_loss = reduced_loss/bps.size()
-            # batch_total, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
-            # reduced_loss = reduced_loss/dist_utils.env_world_size()
+
         top1acc = to_python_float(corr1)*(100.0/batch_total)
         top5acc = to_python_float(corr5)*(100.0/batch_total)
 
@@ -423,12 +428,13 @@ def distributed_predict(input, target, model, criterion, cnt):
         valid_batches = 1
         corr1, corr5 = correct(output.data, target, topk=(1, 5))
 
-    metrics = torch.tensor([batch_size, valid_batches, loss, corr1, corr5]).float().cuda()
-
-    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(metrics, average=False, name="distributed_validation_tensor")
+    dist_validate_tensor[0] = batch_size
+    dist_validate_tensor[1] = valid_batches
+    dist_validate_tensor[2] = loss
+    dist_validate_tensor[3] = corr1
+    dist_validate_tensor[4] = corr5
+    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(dist_validate_tensor, average=False, name="distributed_validation_tensor")
     reduced_loss = reduced_loss/valid_batches
-    # batch_total, valid_batches, reduced_loss, corr1, corr5 = dist_utils.sum_tensor(metrics).cpu().numpy()
-    # reduced_loss = reduced_loss/valid_batches
 
     top1 = corr1*(100.0/batch_total)
     top5 = corr5*(100.0/batch_total)
