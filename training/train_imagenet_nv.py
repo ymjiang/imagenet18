@@ -228,22 +228,11 @@ def main():
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = torch.optim.SGD(optim_params, 0, momentum=args.momentum, weight_decay=args.weight_decay) # start with 0 lr. Scheduler will change this later
 
-    named_param = []
-    for p in optim_params:
-        tensors = p['params']
-        for tensor in tensors:
-            named_param.append(tensor)
-
-    # create bps_param (tuple)
-    bps_param = []
-    for i, tensor in enumerate(named_param):
-        name = name_list[i]
-        bps_param.append((name, tensor))
-
     # wrap with byteps optimizer
     optimizer = bps.DistributedOptimizer(
-        optimizer, named_parameters=bps_param,
-        backward_passes_per_step=args.batches_per_pushpull)
+        optimizer, named_parameters=model.named_parameters(),
+        backward_passes_per_step=args.batches_per_pushpull, half=True,
+        master_params=master_params, loss_scale=args.loss_scale)
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location = lambda storage, loc: storage.cuda(args.local_rank))
@@ -261,7 +250,7 @@ def main():
     # BytePS: broadcast parameters & optimizer state.
     # should use p.detach(), otherwise broadcast p.fill_(0) will report errors.
     # it should not matter because detach is in-place
-    bps.broadcast_parameters([(name, p.detach()) for name, p in bps_param], root_rank=0)
+    bps.broadcast_parameters(model.state_dict(), root_rank=0)
     bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
@@ -318,8 +307,8 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
             loss = loss*args.loss_scale
             model.zero_grad()
             loss.backward()
-            model_grads_to_master_grads(model_params, master_params)
-            for param in master_params: param.grad.data = param.grad.data/args.loss_scale
+            # model_grads_to_master_grads(model_params, master_params)
+            # for param in master_params: param.grad.data = param.grad.data/args.loss_scale
             optimizer.step()
             master_params_to_model_params(model_params, master_params)
             loss = loss/args.loss_scale
