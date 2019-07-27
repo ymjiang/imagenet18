@@ -28,8 +28,8 @@ from logger import TensorboardLogger, FileLogger
 from meter import AverageMeter, NetworkMeter, TimeMeter
 
 from torch.nn.parallel import DistributedDataParallel
-import byteps.torch as bps
-from byteps.torch.ops import push_pull_async_inplace, poll, synchronize
+import horovod.torch as hvd
+from horovod.torch.ops import push_pull_async_inplace, poll, synchronize
 from torchvision import models
 from collections import OrderedDict
 
@@ -180,34 +180,34 @@ schedules = {1: one_machine,
              8: eight_machines,
              16: sixteen_machines}
 
-bps.init()
+hvd.init()
 
 cudnn.benchmark = True
 args = get_parser().parse_args()
 
 # Only want master rank logging to tensorboard
-is_master = (not args.distributed) or (bps.rank()==0)
-is_rank0 = bps.local_rank() == 0
+is_master = (not args.distributed) or (hvd.rank()==0)
+is_rank0 = hvd.local_rank() == 0
 tb = TensorboardLogger(args.logdir, is_master=is_master)
 log = FileLogger(args.logdir, is_master=is_master, is_rank0=is_rank0)
 
 def main():
     # os.system('shutdown -c')  # cancel previous shutdown command
     log.console(args)
-    tb.log('sizes/world', bps.size())
+    tb.log('sizes/world', hvd.size())
 
     # need to index validation directory before we start counting the time
     dataloader.sort_ar(args.data+'/validation')
 
     # if args.distributed:
     # log.console('Distributed initializing process group')
-    torch.cuda.set_device(bps.local_rank())
-    print(f'cuda device set to {bps.local_rank()}')
-    log.console("cuda initialized (rank=%d)"%(bps.local_rank()))
-    # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=bps.size())
-    log.console("Distributed: success (%d/%d)"%(bps.rank(), bps.size()))
+    torch.cuda.set_device(hvd.local_rank())
+    print(f'cuda device set to {hvd.local_rank()}')
+    log.console("cuda initialized (rank=%d)"%(hvd.local_rank()))
+    # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=hvd.size())
+    log.console("Distributed: success (%d/%d)"%(hvd.rank(), hvd.size()))
 
-    log.console("Loading model (rank=%d)"%(bps.rank()))
+    log.console("Loading model (rank=%d)"%(hvd.rank()))
     model = resnet.resnet50(bn0=args.init_bn0).cuda()
 
     # reuse the validate tensor
@@ -234,15 +234,15 @@ def main():
         for tensor in tensors:
             named_param.append(tensor)
 
-    # create bps_param (tuple)
-    bps_param = []
+    # create hvd_param (tuple)
+    hvd_param = []
     for i, tensor in enumerate(named_param):
         name = name_list[i]
-        bps_param.append((name, tensor))
+        hvd_param.append((name, tensor))
 
-    # wrap with byteps optimizer
-    optimizer = bps.DistributedOptimizer(
-        optimizer, named_parameters=bps_param,
+    # wrap with horovod optimizer
+    optimizer = hvd.DistributedOptimizer(
+        optimizer, named_parameters=hvd_param,
         backward_passes_per_step=args.batches_per_pushpull, half=True,
         fp16_params=model_params, fp32_params=master_params, loss_scale=args.loss_scale)
 
@@ -259,11 +259,11 @@ def main():
     dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
-    # BytePS: broadcast parameters & optimizer state.
+    # horovod: broadcast parameters & optimizer state.
     # should use p.detach(), otherwise broadcast p.fill_(0) will report errors.
     # it should not matter because detach is in-place
-    bps.broadcast_parameters([(name, p.detach()) for name, p in bps_param], root_rank=0)
-    bps.broadcast_optimizer_state(optimizer, root_rank=0)
+    hvd.broadcast_parameters([(name, p.detach()) for name, p in hvd_param], root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
     if args.evaluate: return validate(dm.val_dl, model, criterion, 0, start_time)
@@ -338,12 +338,12 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
             validate_tensor[1] = reduced_loss
             validate_tensor[2] = corr1
             validate_tensor[3] = corr5
-            batch_total, reduced_loss, corr1, corr5 = bps.push_pull(validate_tensor, average=False, name="validation_tensor")
+            batch_total, reduced_loss, corr1, corr5 = hvd.push_pull(validate_tensor, average=False, name="validation_tensor")
             batch_total = batch_total.cpu().numpy()
             reduced_loss = reduced_loss.cpu().numpy()
             corr1 = corr1.cpu().numpy()
             corr5 = corr5.cpu().numpy()
-            reduced_loss = reduced_loss/bps.size()
+            reduced_loss = reduced_loss/hvd.size()
 
         top1acc = to_python_float(corr1)*(100.0/batch_total)
         top5acc = to_python_float(corr5)*(100.0/batch_total)
@@ -434,7 +434,7 @@ def distributed_predict(input, target, model, criterion, cnt):
     dist_validate_tensor[2] = loss
     dist_validate_tensor[3] = corr1
     dist_validate_tensor[4] = corr5
-    batch_total, valid_batches, reduced_loss, corr1, corr5 = bps.push_pull(dist_validate_tensor, average=False, name="distributed_validation_tensor")
+    batch_total, valid_batches, reduced_loss, corr1, corr5 = hvd.push_pull(dist_validate_tensor, average=False, name="distributed_validation_tensor")
     reduced_loss = reduced_loss/valid_batches
 
     top1 = corr1*(100.0/batch_total)

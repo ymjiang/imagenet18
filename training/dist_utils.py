@@ -1,7 +1,7 @@
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 import os
-import byteps.torch as bps
+import horovod.torch as hvd
 
 class DDP(DistributedDataParallel):
   # Distributed wrapper. Supports asynchronous evaluation and model saving
@@ -26,7 +26,7 @@ def sum_tensor(tensor):
   return rt
 
 def env_world_size():
-  return bps.size()
+  return hvd.size()
 def env_rank():
-  return bps.rank()
+  return hvd.rank()
 
