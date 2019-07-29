@@ -254,8 +254,9 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer'])
 
     log.console("Creating data loaders (this could take up to 10 minutes if volume needs to be warmed up)")
-    assert (args.machines in schedules)
-    phases = schedules[args.machines]
+    num_machines = (bps.size() - 1) // 8 + 1
+    assert (num_machines in schedules)
+    phases = schedules[num_machines]
     dm = DataManager([copy.deepcopy(p) for p in phases if 'bs' in p])
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
@@ -331,6 +332,7 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
 
         # Train batch done. Logging results
         timer.batch_end()
+        '''
         corr1, corr5 = correct(output.data, target, topk=(1, 5))
         reduced_loss, batch_total = to_python_float(loss.data), to_python_float(input.size(0))
         if args.distributed: # Must keep track of global batch size, since not all machines are guaranteed equal batches at the end of an epoch
@@ -344,16 +346,36 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
             corr1 = corr1.cpu().numpy()
             corr5 = corr5.cpu().numpy()
             reduced_loss = reduced_loss/bps.size()
-
         top1acc = to_python_float(corr1)*(100.0/batch_total)
         top5acc = to_python_float(corr5)*(100.0/batch_total)
 
         losses.update(reduced_loss, batch_total)
         top1.update(top1acc, batch_total)
         top5.update(top5acc, batch_total)
+        '''
 
         should_print = (batch_num%args.print_freq == 0) or (batch_num==len(trn_loader))
         if args.local_rank == 0 and should_print:
+            corr1, corr5 = correct(output.data, target, topk=(1, 5))
+            reduced_loss, batch_total = to_python_float(loss.data), to_python_float(input.size(0))
+            if args.distributed: # Must keep track of global batch size, since not all machines are guaranteed equal batches at the end of an epoch
+                validate_tensor[0] = batch_total
+                validate_tensor[1] = reduced_loss
+                validate_tensor[2] = corr1
+                validate_tensor[3] = corr5
+                batch_total, reduced_loss, corr1, corr5 = bps.push_pull(validate_tensor, average=False, name="validation_tensor")
+                batch_total = batch_total.cpu().numpy()
+                reduced_loss = reduced_loss.cpu().numpy()
+                corr1 = corr1.cpu().numpy()
+                corr5 = corr5.cpu().numpy()
+                reduced_loss = reduced_loss/bps.size()
+
+            top1acc = to_python_float(corr1)*(100.0/batch_total)
+            top5acc = to_python_float(corr5)*(100.0/batch_total)
+
+            losses.update(reduced_loss, batch_total)
+            top1.update(top1acc, batch_total)
+            top5.update(top5acc, batch_total)
             tb.log_memory()
             tb.log_trn_times(timer.batch_time.val, timer.data_time.val, input.size(0))
             tb.log_trn_loss(losses.val, top1.val, top5.val)
@@ -372,7 +394,7 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
                       f'BW {recv_gbit:.3f} {transmit_gbit:.3f}')
             log.verbose(output)
 
-        tb.update_step_count(batch_total)
+            tb.update_step_count(batch_total)
 
 
 def validate(val_loader, model, criterion, epoch, start_time):
