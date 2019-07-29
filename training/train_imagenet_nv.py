@@ -5,6 +5,7 @@ import sys, os
 import math
 import collections
 import gc
+import time
 
 import torch
 from torch.autograd import Variable
@@ -310,20 +311,24 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         timer.batch_start()
         scheduler.update_lr(epoch, i+1, len(trn_loader))
 
+        time_start = time.time()
         # compute output
         output = model(input)
         loss = criterion(output, target)
+        time_forward = time.time()
 
         # compute gradient and do SGD step
         if args.fp16:
             loss = loss*args.loss_scale
             model.zero_grad()
             loss.backward()
+            time_backward = time.time()
             # model_grads_to_master_grads(model_params, master_params)
             # for param in master_params: param.grad.data = param.grad.data/args.loss_scale
             optimizer.step()
             master_params_to_model_params(model_params, master_params)
             loss = loss/args.loss_scale
+            time_optimize = time.time()
         else:
             optimizer.zero_grad()
             loss.backward()
@@ -373,6 +378,15 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
             log.verbose(output)
 
         tb.update_step_count(batch_total)
+
+        time_end = time.time()
+
+        total_time = time_end-time_start
+        log.console(f'forward: {(time_forward-time_start)/total_time:.2f}\t'
+                    f'backward: {(time_backward-time_forward)/total_time:.2f}\t'
+                    f'optimize: {(time_optimize-time_backward)/total_time:.2f}\t'
+                    f'validate: {(time_end-time_optimize)/total_time:.2f}'
+                    f'total_time: {total_time:.2f}s')
 
 
 def validate(val_loader, model, criterion, epoch, start_time):
