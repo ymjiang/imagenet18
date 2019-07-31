@@ -27,9 +27,9 @@ import experimental_utils
 from logger import TensorboardLogger, FileLogger
 from meter import AverageMeter, NetworkMeter, TimeMeter
 
-from torch.nn.parallel import DistributedDataParallel
 import byteps.torch as bps
 from byteps.torch.ops import push_pull_async_inplace, poll, synchronize
+from byteps.misc.imagenet18 import DistributedOptimizer, broadcast_parameters, broadcast_optimizer_state
 from torchvision import models
 from collections import OrderedDict
 
@@ -241,9 +241,9 @@ def main():
         bps_param.append((name, tensor))
 
     # wrap with byteps optimizer
-    optimizer = bps.DistributedOptimizer(
+    optimizer = DistributedOptimizer(
         optimizer, named_parameters=bps_param,
-        backward_passes_per_step=args.batches_per_pushpull, half=True,
+        backward_passes_per_step=args.batches_per_pushpull, half=True, model=model,
         fp16_params=model_params, fp32_params=master_params, loss_scale=args.loss_scale)
 
     if args.resume:
@@ -263,8 +263,8 @@ def main():
     # BytePS: broadcast parameters & optimizer state.
     # should use p.detach(), otherwise broadcast p.fill_(0) will report errors.
     # it should not matter because detach is in-place
-    bps.broadcast_parameters([(name, p.detach()) for name, p in bps_param], root_rank=0)
-    bps.broadcast_optimizer_state(optimizer, root_rank=0)
+    broadcast_parameters([(name, p.detach()) for name, p in bps_param], root_rank=0)
+    broadcast_optimizer_state(optimizer, root_rank=0)
 
     start_time = datetime.now() # Loading start to after everything is loaded
     if args.evaluate: return validate(dm.val_dl, model, criterion, 0, start_time)
@@ -315,15 +315,17 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         output = model(input)
         loss = criterion(output, target)
 
+        should_print = (batch_num%args.print_freq == 0) or (batch_num==len(trn_loader))
+
         # compute gradient and do SGD step
         if args.fp16:
             loss = loss*args.loss_scale
-            model.zero_grad()
+            # model.zero_grad()
             loss.backward()
             # model_grads_to_master_grads(model_params, master_params)
             # for param in master_params: param.grad.data = param.grad.data/args.loss_scale
-            optimizer.step()
-            master_params_to_model_params(model_params, master_params)
+            optimizer.step(wait_for_finish=should_print)
+            # master_params_to_model_params(model_params, master_params)
             loss = loss/args.loss_scale
         else:
             optimizer.zero_grad()
@@ -354,7 +356,6 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         top5.update(top5acc, batch_total)
         '''
 
-        should_print = (batch_num%args.print_freq == 0) or (batch_num==len(trn_loader))
         if args.local_rank == 0 and should_print:
             corr1, corr5 = correct(output.data, target, topk=(1, 5))
             reduced_loss, batch_total = to_python_float(loss.data), to_python_float(input.size(0))
