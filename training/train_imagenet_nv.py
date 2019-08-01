@@ -261,8 +261,6 @@ def main():
     scheduler = Scheduler(optimizer, [copy.deepcopy(p) for p in phases if 'lr' in p])
 
     # BytePS: broadcast parameters & optimizer state.
-    # should use p.detach(), otherwise broadcast p.fill_(0) will report errors.
-    # it should not matter because detach is in-place
     broadcast_parameters([(name, p.detach()) for name, p in bps_param], root_rank=0)
     broadcast_optimizer_state(optimizer, root_rank=0)
 
@@ -320,12 +318,9 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         # compute gradient and do SGD step
         if args.fp16:
             loss = loss*args.loss_scale
-            # model.zero_grad()
+            # zero_grad() and converting fp16/fp32 is handled in optimizer
             loss.backward()
-            # model_grads_to_master_grads(model_params, master_params)
-            # for param in master_params: param.grad.data = param.grad.data/args.loss_scale
             optimizer.step(wait_for_finish=should_print)
-            # master_params_to_model_params(model_params, master_params)
             loss = loss/args.loss_scale
         else:
             optimizer.zero_grad()
@@ -334,27 +329,6 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
 
         # Train batch done. Logging results
         timer.batch_end()
-        '''
-        corr1, corr5 = correct(output.data, target, topk=(1, 5))
-        reduced_loss, batch_total = to_python_float(loss.data), to_python_float(input.size(0))
-        if args.distributed: # Must keep track of global batch size, since not all machines are guaranteed equal batches at the end of an epoch
-            validate_tensor[0] = batch_total
-            validate_tensor[1] = reduced_loss
-            validate_tensor[2] = corr1
-            validate_tensor[3] = corr5
-            batch_total, reduced_loss, corr1, corr5 = bps.push_pull(validate_tensor, average=False, name="validation_tensor")
-            batch_total = batch_total.cpu().numpy()
-            reduced_loss = reduced_loss.cpu().numpy()
-            corr1 = corr1.cpu().numpy()
-            corr5 = corr5.cpu().numpy()
-            reduced_loss = reduced_loss/bps.size()
-        top1acc = to_python_float(corr1)*(100.0/batch_total)
-        top5acc = to_python_float(corr5)*(100.0/batch_total)
-
-        losses.update(reduced_loss, batch_total)
-        top1.update(top1acc, batch_total)
-        top5.update(top5acc, batch_total)
-        '''
 
         if args.local_rank == 0 and should_print:
             corr1, corr5 = correct(output.data, target, topk=(1, 5))
