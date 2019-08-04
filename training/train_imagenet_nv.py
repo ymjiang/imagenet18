@@ -275,6 +275,18 @@ def main():
             if poll(barrier_handler):
                 synchronize(barrier_handler)
                 break
+        # do broadcast for validate tensor
+        log.console('Broadcasting validate tensor')
+        barrier_handler = push_pull_async_inplace(validate_tensor, average=True, name="validation_tensor")
+        while True:
+            if poll(barrier_handler):
+                synchronize(barrier_handler)
+                break
+        barrier_handler = push_pull_async_inplace(dist_validate_tensor, average=True, name="distributed_validation_tensor")
+        while True:
+            if poll(barrier_handler):
+                synchronize(barrier_handler)
+                break
 
     log.event("~~epoch\thours\ttop1\ttop5\n")
     for epoch in range(args.start_epoch, scheduler.tot_epochs):
