@@ -3,5 +3,4 @@ boto3
 ncluster
 paramiko
 portpicker
-tensorflow
 tzlocal
