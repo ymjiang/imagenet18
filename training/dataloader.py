@@ -16,10 +16,15 @@ import pickle
 from tqdm import tqdm
 from dist_utils import env_world_size, env_rank
 
+class SyntheticBatchSampler(object):
+    def __init__(self, batch_size):
+        self.batch_size = batch_size
+
 
 class SyntheticDataLoader(object):
     def __init__(self, batch_size, input_shape):
         # Create two random tensors - one for data and one for label
+        self.input_shape = input_shape
         data_shape = (batch_size,) + input_shape
         self.data = torch.randn(data_shape)
         self.labels = torch.from_numpy(
@@ -28,9 +33,10 @@ class SyntheticDataLoader(object):
         self.prefetchable = False
         self.data = self.data.cuda()
         self.labels = self.labels.cuda()
-        self.batch_size = batch_size
-        self.batch_num = 1281167 // (env_world_size() * self.batch_size) + 1
         self.finish = 0
+        self.batch_size = batch_size
+        self.batch_sampler = SyntheticBatchSampler(batch_size)
+        self.batch_num = 1281167 // (env_world_size() * self.batch_sampler.batch_size) + 1
 
     def next(self):
         """Return next tuple training tuple.
@@ -43,9 +49,18 @@ class SyntheticDataLoader(object):
         return self
 
     def __len__(self):
-        return self.batch_num
+        return 1281167 // (env_world_size() * self.batch_sampler.batch_size) + 1
 
     def __next__(self):
+        if self.batch_size != self.batch_sampler.batch_size:
+            self.batch_size = self.batch_sampler.batch_size
+            data_shape = (self.batch_size,) + self.input_shape
+            self.data = torch.randn(data_shape)
+            self.labels = torch.from_numpy(
+                np.random.randint(0, 1000, self.batch_size).astype(np.long)
+            )
+            self.data = self.data.cuda()
+            self.batch_num = 1281167 // (env_world_size() * self.batch_sampler.batch_size) + 1
         if self.finish >= self.batch_num:
             self.finish = 0
             raise StopIteration
