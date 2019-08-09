@@ -16,6 +16,43 @@ import pickle
 from tqdm import tqdm
 from dist_utils import env_world_size, env_rank
 
+
+class SyntheticDataLoader(object):
+    def __init__(self, batch_size, input_shape):
+        # Create two random tensors - one for data and one for label
+        data_shape = (batch_size,) + input_shape
+        self.data = torch.randn(data_shape)
+        self.labels = torch.from_numpy(
+            np.random.randint(0, 1000, batch_size).astype(np.long)
+        )
+        self.prefetchable = False
+        self.data = self.data.cuda()
+        self.labels = self.labels.cuda()
+        self.batch_size = batch_size
+        self.batch_num = 1281167 // (env_world_size() * self.batch_size) + 1
+        self.finish = 0
+
+    def next(self):
+        """Return next tuple training tuple.
+        Returns:
+            A tuple of (X, Y)
+        """
+        return (self.data, self.labels)
+
+    def __iter__(self):
+        return self
+
+    def __len__(self):
+        return self.batch_num
+
+    def __next__(self):
+        if self.finish >= self.batch_num:
+            self.finish = 0
+            raise StopIteration
+        self.finish += 1
+        return (self.data, self.labels)
+
+
 def get_loaders(traindir, valdir, sz, bs, fp16=True, val_bs=None, workers=8, rect_val=False, min_scale=0.08, distributed=False):
     val_bs = val_bs or bs
     train_tfms = [
@@ -25,10 +62,10 @@ def get_loaders(traindir, valdir, sz, bs, fp16=True, val_bs=None, workers=8, rec
     train_dataset = datasets.ImageFolder(traindir, transforms.Compose(train_tfms))
     train_sampler = (DistributedSampler(train_dataset, num_replicas=env_world_size(), rank=env_rank()) if distributed else None)
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=bs, shuffle=(train_sampler is None),
-        num_workers=workers, pin_memory=True, collate_fn=fast_collate, 
-        sampler=train_sampler)
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=bs, shuffle=(train_sampler is None),
+    #     num_workers=workers, pin_memory=True, collate_fn=fast_collate, 
+    #     sampler=train_sampler)
 
     val_dataset, val_sampler = create_validation_set(valdir, val_bs, sz, rect_val=rect_val, distributed=distributed)
     val_loader = torch.utils.data.DataLoader(
@@ -36,6 +73,7 @@ def get_loaders(traindir, valdir, sz, bs, fp16=True, val_bs=None, workers=8, rec
         num_workers=workers, pin_memory=True, collate_fn=fast_collate, 
         batch_sampler=val_sampler)
 
+    train_loader = SyntheticDataLoader(bs, (3, sz, sz))
     train_loader = BatchTransformDataLoader(train_loader, fp16=fp16)
     val_loader = BatchTransformDataLoader(val_loader, fp16=fp16)
 
